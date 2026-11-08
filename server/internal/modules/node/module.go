@@ -1,0 +1,559 @@
+// Package node 合并管理动态组件和共享节点池，提供组件安装、卸载和节点池 CRUD 能力。
+package node
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"sort"
+	"strings"
+
+	"github.com/rulego/rulego/api/types"
+	endpointApi "github.com/rulego/rulego/api/types/endpoint"
+	"github.com/rulego/rulego/engine"
+	"github.com/rulego/rulego/node_pool"
+	"github.com/rulego/rulego/server/app"
+	"github.com/rulego/rulego/server/config"
+	"github.com/rulego/rulego/server/internal/constants"
+	serverEngine "github.com/rulego/rulego/server/internal/engine"
+	"github.com/rulego/rulego/server/services"
+	"github.com/rulego/rulego/server/store"
+	"github.com/rulego/rulego/utils/fs"
+)
+
+const (
+	ModuleName = "node"
+	Priority   = 35
+)
+
+// Module node 业务模块，负责组件和共享节点池的管理。
+type Module struct {
+	cfg           *config.Config
+	logger        types.Logger
+	engineMgr     services.EngineManager
+	storeProvider store.StoreProvider
+	container     *app.Container
+	// globalPoolData 全局节点池文件内容，Init 时读入，由引擎创建 hook 分发给每个用户池
+	globalPoolData []byte
+}
+
+// New 创建 node 模块
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string  { return ModuleName }
+func (m *Module) Priority() int { return Priority }
+
+func (m *Module) Init(ctx *app.ModuleContext) error {
+	m.cfg = ctx.Config
+	m.logger = ctx.Logger
+
+	mgr, err := app.GetAs[services.EngineManager](ctx.Container, "module.rule.engine_manager")
+	if err != nil {
+		return err
+	}
+	m.engineMgr = mgr
+
+	storeProvider, err := app.GetAs[store.StoreProvider](ctx.Container, "store.provider")
+	if err != nil {
+		return err
+	}
+	m.storeProvider = storeProvider
+	m.container = ctx.Container
+
+	if m.cfg.NodePoolFile != "" {
+		if buf, err := os.ReadFile(m.cfg.NodePoolFile); err == nil {
+			m.globalPoolData = buf
+		} else if !os.IsNotExist(err) {
+			m.logger.Errorf("load node pool file error: %s", err)
+		}
+	}
+
+	// 规则链由 rule 模块 Start 加载，早于本模块 Start；共享节点池与动态组件必须
+	// 在引擎创建时就位，否则 endpoint 引用 ref:// 共享节点的链会初始化失败且无重试。
+	m.registerEngineHook()
+
+	if err := ctx.Container.Register(services.KeyNodeService, services.NodeService(m)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Module) registerEngineHook() {
+	if mgr, ok := m.engineMgr.(*serverEngine.Manager); ok {
+		mgr.SetEngineCreatedHook(m.loadEngineResources)
+	}
+}
+
+// Start 无操作：共享节点池与动态组件在引擎创建时由 hook 加载，见 Init。
+func (m *Module) Start(_ context.Context) error { return nil }
+
+// loadEngineResources 加载全局池、用户私有池与动态组件到引擎。hook 在 Manager 写锁内
+// 执行，禁止回调 GetOrCreate（重入死锁），资源全部来自入参 ue。
+func (m *Module) loadEngineResources(ue *serverEngine.UserEngine) {
+	pool, ok := ue.RuleConfig().NodePool.(*node_pool.NodePool)
+	if !ok {
+		return
+	}
+	if len(m.globalPoolData) > 0 {
+		if _, err := pool.Load(m.globalPoolData); err != nil {
+			m.logger.Errorf("load global node pool for user=%s error: %s", ue.Username(), err)
+		}
+	}
+	var mcpSvc services.McpToolService
+	if svc, ok := m.container.Get(constants.SvcMcpService); ok {
+		mcpSvc, _ = svc.(services.McpToolService)
+	}
+	svc, err := m.ForUser(ue.Username(), ue.RuleConfig(), pool, mcpSvc)
+	if err != nil {
+		m.logger.Errorf("create node service for user=%s error: %s", ue.Username(), err)
+		return
+	}
+	if err := svc.UserNodePoolService.Load(); err != nil {
+		m.logger.Errorf("load user node pool for user=%s error: %s", ue.Username(), err)
+	}
+	svc.UserComponentService.LoadComponents()
+}
+func (m *Module) Stop(_ context.Context) error { return nil }
+
+// getUserService 获取用户级节点服务
+func (m *Module) getUserService(username string) (*UserNodeService, error) {
+	ue, err := m.engineMgr.GetOrCreate(username)
+	if err != nil {
+		return nil, err
+	}
+	pool, ok := ue.RuleConfig().NodePool.(*node_pool.NodePool)
+	if !ok {
+		pool = node_pool.NewNodePool(ue.RuleConfig())
+	}
+	// MCP service is optional; retrieve from container if available
+	var mcpSvc services.McpToolService
+	if svc, ok := m.container.Get(constants.SvcMcpService); ok {
+		mcpSvc, _ = svc.(services.McpToolService)
+	}
+	return m.ForUser(username, ue.RuleConfig(), pool, mcpSvc)
+}
+
+// NodeService 实现
+
+func (m *Module) ListComponents(username, keywords string, size, page int) ([]types.RuleChain, int, error) {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return nil, 0, err
+	}
+	return svc.UserComponentService.List(keywords, size, page)
+}
+
+func (m *Module) GetComponent(username, nodeType string) ([]byte, error) {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return nil, err
+	}
+	return svc.UserComponentService.Get(nodeType)
+}
+
+func (m *Module) InstallComponent(username, id string, dsl []byte) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.Install(id, dsl)
+}
+
+func (m *Module) UpgradeComponent(username, id string, dsl []byte) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.Upgrade(id, dsl)
+}
+
+func (m *Module) UninstallComponent(username, nodeType string) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.Uninstall(nodeType)
+}
+
+func (m *Module) ListNodePool(username string, page, size int, keywords, category string) ([]interface{}, int, error) {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return nil, 0, err
+	}
+	return svc.UserNodePoolService.List(page, size, keywords, category)
+}
+
+func (m *Module) GetNodePool(username, id, nodeType string) (*types.RuleNode, error) {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return nil, err
+	}
+	return svc.UserNodePoolService.Get(id, nodeType)
+}
+
+func (m *Module) SaveNodePoolNode(username string, node types.RuleNode) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.SaveNode(node)
+}
+
+func (m *Module) SaveNodePoolEndpoint(username string, endpointDef types.EndpointDsl) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.SaveEndpoint(endpointDef)
+}
+
+func (m *Module) DeleteNodePool(username, id, nodeType string) error {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return err
+	}
+	return svc.Delete(id, nodeType)
+}
+
+func (m *Module) GetComponentForms(username string) []types.ComponentForm {
+	ue, ok := m.engineMgr.Get(username)
+	if !ok || ue == nil {
+		return nil
+	}
+	return ue.RuleConfig().ComponentsRegistry.GetComponentForms().Values()
+}
+
+func (m *Module) GetNodePoolDefs(username string) (map[string][]*types.RuleNode, error) {
+	svc, err := m.getUserService(username)
+	if err != nil {
+		return nil, err
+	}
+	return svc.UserNodePoolService.GetPool().GetAllDef()
+}
+
+// ForUser 为指定用户创建组件和节点池服务实例
+func (m *Module) ForUser(username string, ruleConfig types.Config, pool *node_pool.NodePool, mcpSvc services.McpToolService) (*UserNodeService, error) {
+	componentStore, err := m.storeProvider.GetComponentStore(username)
+	if err != nil {
+		return nil, err
+	}
+	nodePoolStore, err := m.storeProvider.GetNodePoolStore(username)
+	if err != nil {
+		return nil, err
+	}
+	// 开启 share_http_server 时，主 HTTP server 会被注入用户池；其 id（=config.Server）标记为系统只读节点。
+	systemNodeId := ""
+	if m.cfg.ShareHttpServer {
+		systemNodeId = m.cfg.Server
+	}
+	return &UserNodeService{
+		UserComponentService: &UserComponentService{
+			username:   username,
+			config:     m.cfg,
+			ruleConfig: ruleConfig,
+			store:      componentStore,
+			mcpSvc:     mcpSvc,
+		},
+		UserNodePoolService: &UserNodePoolService{
+			store:        nodePoolStore,
+			nodePool:     pool,
+			systemNodeId: systemNodeId,
+		},
+	}, nil
+}
+
+// UserNodeService 用户级节点服务，组合了组件和节点池能力
+type UserNodeService struct {
+	*UserComponentService
+	*UserNodePoolService
+}
+
+// UserComponentService 用户级组件服务（从原 component 模块合并）
+type UserComponentService struct {
+	username   string
+	config     *config.Config
+	ruleConfig types.Config
+	store      store.ComponentStore
+	mcpSvc     services.McpToolService
+}
+
+func (s *UserComponentService) GetRuleConfig() types.Config {
+	return s.ruleConfig
+}
+
+func (s *UserComponentService) LoadComponents() {
+	folderPath := path.Join(s.config.DataDir, constants.DirWorkflows, s.username, constants.DirWorkflowsComponent)
+	_ = fs.CreateDirs(folderPath)
+	folderPath = folderPath + "/*.json"
+	paths, err := fs.GetFilePaths(folderPath)
+	if err != nil {
+		return
+	}
+	for _, p := range paths {
+		fileName := p[len(folderPath)-len("*.json"):]
+		chainId := fileName[:len(fileName)-len(".json")]
+		if def, err := s.store.Get(s.username, chainId); err == nil {
+			var ruleChain types.RuleChain
+			if err = json.Unmarshal(def, &ruleChain); err != nil {
+				continue
+			}
+			if err = s.ComponentsRegistry().Register(engine.NewDynamicNode(ruleChain.RuleChain.ID, string(def))); err != nil {
+				if s.ruleConfig.Logger != nil {
+					s.ruleConfig.Logger.Errorf("load component id=%s error: %s", ruleChain.RuleChain.ID, err.Error())
+				}
+				continue
+			}
+		}
+	}
+}
+
+func (s *UserComponentService) ComponentsRegistry() types.ComponentRegistry {
+	return s.ruleConfig.ComponentsRegistry
+}
+
+func (s *UserComponentService) List(keywords string, size, page int) ([]types.RuleChain, int, error) {
+	dataList, total, err := s.store.List(s.username, keywords, size, page)
+	if err != nil {
+		return nil, 0, err
+	}
+	var ruleChains []types.RuleChain
+	for _, data := range dataList {
+		var ruleChain types.RuleChain
+		if err := json.Unmarshal(data, &ruleChain); err != nil {
+			continue
+		}
+		ruleChains = append(ruleChains, ruleChain)
+	}
+	return ruleChains, total, nil
+}
+
+func (s *UserComponentService) Get(nodeType string) ([]byte, error) {
+	return s.store.Get(s.username, nodeType)
+}
+
+func (s *UserComponentService) Install(id string, dsl []byte) error {
+	// 注册键与存储键都以路径 id 为准，重启加载却按 DSL 内的 ruleChain.id 注册：
+	// 两者不一致会让组件在重启后换类型，引用路径 id 的规则链节点找不到组件
+	var def types.RuleChain
+	if err := json.Unmarshal(dsl, &def); err != nil {
+		return err
+	}
+	if def.RuleChain.ID != id {
+		return fmt.Errorf("component id mismatch: body ruleChain.id=%s, path id=%s", def.RuleChain.ID, id)
+	}
+	dynamicNode := engine.NewDynamicNode(id, string(dsl))
+	err := s.ComponentsRegistry().Register(dynamicNode)
+	if err != nil {
+		return err
+	}
+	if err = s.store.Save(s.username, dynamicNode.Type(), []byte(dynamicNode.Dsl)); err != nil {
+		// 落盘失败回滚注册，否则组件重启前可用、重启后消失
+		_ = s.ComponentsRegistry().Unregister(id)
+		return err
+	}
+	if s.mcpSvc != nil {
+		s.mcpSvc.AddToolsFromComponent(s.username, dynamicNode.Type(), dynamicNode.Def())
+	}
+	return nil
+}
+
+func (s *UserComponentService) Upgrade(id string, dsl []byte) error {
+	_ = s.ComponentsRegistry().Unregister(id)
+	return s.Install(id, dsl)
+}
+
+func (s *UserComponentService) Uninstall(nodeType string) error {
+	if s.mcpSvc != nil {
+		s.mcpSvc.DeleteTools(s.username, nodeType)
+	}
+	_ = s.ComponentsRegistry().Unregister(nodeType)
+	return s.store.Delete(s.username, nodeType)
+}
+
+// UserNodePoolService 用户级共享节点池服务（从原 nodepool 模块合并）。
+// 注意：开启 share_http_server 后，主 HTTP server 端点会被注入用户池作为「系统只读节点」
+// （id = config.Server）。该节点禁止改/删/持久化，相关写操作（SaveNode/SaveEndpoint/Delete/saveState）
+// 均通过 isSystemNode 拦截。未来新增任何 node_pool 写操作必须同步加此保护，否则会拉垮共享 server。
+type UserNodePoolService struct {
+	store        store.NodePoolStore
+	nodePool     *node_pool.NodePool
+	systemNodeId string // 系统注入的只读节点 id（如主 HTTP server 的 :9090）；非空时该 id 不可改/删/持久化
+}
+
+// isSystemNode 判断给定 id 是否为系统注入的只读节点。
+func (s *UserNodePoolService) isSystemNode(id string) bool {
+	return s.systemNodeId != "" && id == s.systemNodeId
+}
+
+func (s *UserNodePoolService) Load() error {
+	data, err := s.store.Get()
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	_, err = s.nodePool.Load(data)
+	return err
+}
+
+func (s *UserNodePoolService) GetPool() *node_pool.NodePool {
+	return s.nodePool
+}
+
+func (s *UserNodePoolService) List(page, size int, keywords, category string) ([]interface{}, int, error) {
+	list := make([]interface{}, 0)
+	all := s.nodePool.GetAll()
+
+	type item struct {
+		Ctx        types.SharedNodeCtx
+		Def        types.RuleNode
+		IsEndpoint bool
+	}
+
+	var items []item
+	for _, ctx := range all {
+		var def types.RuleNode
+		if err := json.Unmarshal(ctx.DSL(), &def); err != nil {
+			continue
+		}
+		isEndpoint := false
+		if _, ok := ctx.GetNode().(endpointApi.Endpoint); ok {
+			isEndpoint = true
+		}
+		if category == "endpoint" && !isEndpoint {
+			continue
+		}
+		if category == "node" && isEndpoint {
+			continue
+		}
+		if keywords != "" {
+			if !strings.Contains(def.Id, keywords) && !strings.Contains(def.Name, keywords) {
+				continue
+			}
+		}
+		items = append(items, item{Ctx: ctx, Def: def, IsEndpoint: isEndpoint})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Def.Id < items[j].Def.Id
+	})
+
+	total := len(items)
+	if size <= 0 {
+		size = 20
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	start := (page - 1) * size
+	end := start + size
+	if start >= total {
+		return []interface{}{}, total, nil
+	}
+	if end > total {
+		end = total
+	}
+
+	for _, it := range items[start:end] {
+		if it.IsEndpoint {
+			var endpointDef types.EndpointDsl
+			_ = json.Unmarshal(it.Ctx.DSL(), &endpointDef)
+			list = append(list, endpointDef)
+		} else {
+			list = append(list, it.Def)
+		}
+	}
+
+	return list, total, nil
+}
+
+func (s *UserNodePoolService) SaveNode(node types.RuleNode) error {
+	if s.isSystemNode(node.Id) {
+		return errors.New("system node cannot be modified")
+	}
+	s.nodePool.Del(node.Id)
+	if _, err := s.nodePool.NewFromRuleNode(node); err != nil {
+		return err
+	}
+	return s.saveState()
+}
+
+func (s *UserNodePoolService) SaveEndpoint(endpoint types.EndpointDsl) error {
+	if s.isSystemNode(endpoint.Id) {
+		return errors.New("system node cannot be modified")
+	}
+	s.nodePool.Del(endpoint.Id)
+	if _, err := s.nodePool.NewFromEndpoint(endpoint); err != nil {
+		return err
+	}
+	return s.saveState()
+}
+
+func (s *UserNodePoolService) Delete(id, nodeType string) error {
+	if s.isSystemNode(id) {
+		return errors.New("system node cannot be deleted")
+	}
+	s.nodePool.Del(id)
+	return s.saveState()
+}
+
+func (s *UserNodePoolService) Get(id, nodeType string) (*types.RuleNode, error) {
+	defs, err := s.nodePool.GetAllDef()
+	if err != nil {
+		return nil, err
+	}
+	for _, nodes := range defs {
+		for _, node := range nodes {
+			if node.Id == id {
+				return node, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (s *UserNodePoolService) saveState() error {
+	all := s.nodePool.GetAll()
+
+	dsl := types.RuleChain{
+		RuleChain: types.RuleChainBaseInfo{
+			ID:   "node_pool",
+			Name: "Shared Node Pool",
+		},
+		Metadata: types.RuleMetadata{
+			Nodes:     []*types.RuleNode{},
+			Endpoints: []*types.EndpointDsl{},
+		},
+	}
+
+	for _, ctx := range all {
+		if s.isSystemNode(ctx.GetNodeId().Id) {
+			continue // 系统节点不持久化（避免重启重建实例与主 server 抢端口）
+		}
+		raw := ctx.DSL()
+		if _, ok := ctx.GetNode().(endpointApi.Endpoint); ok {
+			var ep types.EndpointDsl
+			if err := json.Unmarshal(raw, &ep); err == nil {
+				dsl.Metadata.Endpoints = append(dsl.Metadata.Endpoints, &ep)
+			}
+		} else {
+			var node types.RuleNode
+			if err := json.Unmarshal(raw, &node); err == nil {
+				dsl.Metadata.Nodes = append(dsl.Metadata.Nodes, &node)
+			}
+		}
+	}
+
+	bytes, err := json.MarshalIndent(dsl, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.store.Save(bytes)
+}

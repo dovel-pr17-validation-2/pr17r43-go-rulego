@@ -1,0 +1,331 @@
+# 发版流水线：tag v* 触发。产物四路分发：
+#   1. GitHub Release 附件（各平台归档 + sha256sums.txt + K8s all-in-one.yaml，install.sh 的下载源）
+#   2. Docker 多架构镜像（Docker Hub + GHCR）
+#   3. Helm chart（oci://ghcr.io/rulego/charts/rulego-server）
+#   4. all-in-one.yaml（helm template 生成，供 kubectl apply -f）
+
+name: build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 创建 Release
+  packages: write   # 推 GHCR 镜像与 chart
+
+env:
+  IMAGE_HUB: docker.io/rulego/rulego-server
+  IMAGE_GHCR: ghcr.io/rulego/rulego-server
+  # 阿里云公共镜像（国内可达）：配 ALIYUN_REGISTRY（如 registry.cn-hangzhou.aliyuncs.com）、
+  # ALIYUN_USERNAME、ALIYUN_PASSWORD 三个 Secrets 即自动启用；镜像仓（rulego/rulego-server）
+  # 需先在阿里云容器镜像服务控制台手动创建并设为公开（个人实例不支持首推自动建仓）。
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: go.sum
+      - name: Install dependencies
+        run: go get .
+      # 前端 editor 不开源（私有仓 whki/rulego-editor），CI 拉取并构建 SPA 产物，
+      # 产物不进 rulego 仓库（server/.gitignore 排除 editor/），仅打入 release 包随二进制分发。
+      - name: Checkout editor (private)
+        uses: actions/checkout@v4
+        with:
+          repository: whki/rulego-editor
+          ref: ${{ vars.EDITOR_REF || 'main' }} # 如需锁版本：在 rulego 仓库 Variables 设 EDITOR_REF 为 tag/commit
+          token: ${{ secrets.EDITOR_REPO_TOKEN }} # fine-grained PAT，仅 whki/rulego-editor 的 contents:read
+          path: rulego-editor
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: rulego-editor/package-lock.json
+      - name: Build editor UI
+        run: |
+          cd rulego-editor
+          npm ci
+          rm -rf dist
+          # 嵌入 rulego server（base=/editor/）。
+          # build:editor:same-origin：生产同源部署（editor 与 API 同域名），
+          # 清空 config.js 写死地址，运行时用 location.origin 自动适配后端。
+          # 连别的后端：改用 build:editor:remote -- http://x:9090，或部署后用 ?apiBase= URL 参数。
+          npm run build:editor:same-origin
+          mkdir -p ../server/cmd/server/editor
+          cp -r dist/. ../server/cmd/server/editor/
+          # 手册 PDF 不随发布包分发（16MB×14 包≈185MB）：server 无 go:embed，删文件即全链路剥离；
+          # 线上未放置时「使用手册」菜单 404，在线阅读走官网
+          rm -f ../server/cmd/server/editor/user-manual.pdf
+      - name: Build for Linux and Windows and Macos
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cd server/cmd/server
+          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # 版本注入：API /api/v1/version 与二进制 -v 都读这两处
+          LDFLAGS="-s -w -extldflags '-static' -X github.com/rulego/rulego/server/internal/constants.ServerVersion=${VERSION} -X main.BuildTime=${BUILD_TIME}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-linux-amd64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-windows-amd64.exe
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-macos-amd64
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-linux-arm64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-macos-arm64
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -tags "with_all" -v -o rulego-server-all-windows-arm64.exe
+          CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-linux-amd64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-windows-amd64.exe
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-macos-amd64
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-linux-arm64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-macos-arm64
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-windows-arm64.exe
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags "$LDFLAGS" -tags "with_extend,with_iot" -v -o rulego-server-all-linux-386
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags "$LDFLAGS" -v -o rulego-server-linux-386
+      - name: Create compressed archives
+        run: |
+          cp server/config.conf server/cmd/server/config.conf
+          cp server/node_pool.json server/cmd/server/node_pool.json
+          cd server/cmd/server
+          # All-in-one builds (with all extensions)
+          tar -czf rulego-server-all-linux-amd64.tar.gz rulego-server-all-linux-amd64 config.conf node_pool.json editor
+          zip -r rulego-server-all-windows-amd64.zip rulego-server-all-windows-amd64.exe config.conf node_pool.json editor
+          tar -czf rulego-server-all-macos-amd64.tar.gz rulego-server-all-macos-amd64 config.conf node_pool.json editor
+          tar -czf rulego-server-all-linux-arm64.tar.gz rulego-server-all-linux-arm64 config.conf node_pool.json editor
+          tar -czf rulego-server-all-macos-arm64.tar.gz rulego-server-all-macos-arm64 config.conf node_pool.json editor
+          zip -r rulego-server-all-windows-arm64.zip rulego-server-all-windows-arm64.exe config.conf node_pool.json editor
+          tar -czf rulego-server-all-linux-386.tar.gz rulego-server-all-linux-386 config.conf node_pool.json editor
+
+          # Standard builds (without optional extensions)
+          tar -czf rulego-server-linux-amd64.tar.gz rulego-server-linux-amd64 config.conf node_pool.json editor
+          zip -r rulego-server-windows-amd64.zip rulego-server-windows-amd64.exe config.conf node_pool.json editor
+          tar -czf rulego-server-macos-amd64.tar.gz rulego-server-macos-amd64 config.conf node_pool.json editor
+          tar -czf rulego-server-linux-arm64.tar.gz rulego-server-linux-arm64 config.conf node_pool.json editor
+          tar -czf rulego-server-macos-arm64.tar.gz rulego-server-macos-arm64 config.conf node_pool.json editor
+          zip -r rulego-server-windows-arm64.zip rulego-server-windows-arm64.exe config.conf node_pool.json editor
+          tar -czf rulego-server-linux-386.tar.gz rulego-server-linux-386 config.conf node_pool.json editor
+          sha256sum *.tar.gz *.zip > sha256sums.txt
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rulego-server-compressed
+          path: |
+            server/cmd/server/*.tar.gz
+            server/cmd/server/*.zip
+            server/cmd/server/sha256sums.txt
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            archive: rulego-server-all-linux-amd64.tar.gz
+          - platform: linux/arm64
+            arch: arm64
+            archive: rulego-server-all-linux-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          name: rulego-server-compressed
+          path: archives
+      - name: Prepare build context
+        run: |
+          mkdir -p context
+          tar -xzf "archives/${{ matrix.archive }}" -C context
+      - name: Docker Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        # secrets 上下文在 step 级 if 可用：未配 Docker Hub Secrets 时降级为仅 GHCR
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to Aliyun Registry
+        if: ${{ secrets.ALIYUN_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+      - name: Compose push targets
+        id: targets
+        env:
+          HAS_HUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_ALIYUN: ${{ secrets.ALIYUN_USERNAME != '' }}
+        run: |
+          # GHCR 恒推；Docker Hub/阿里云按 Secrets 是否配置门控，未配自动降级
+          TARGETS="type=image,name=${IMAGE_GHCR},push-by-digest=true,name-canonical=true,push=true"
+          if [ "${HAS_HUB}" = "true" ]; then
+            TARGETS="type=image,name=${IMAGE_HUB},push-by-digest=true,name-canonical=true,push=true,${TARGETS}"
+          fi
+          if [ "${HAS_ALIYUN}" = "true" ]; then
+            TARGETS="${TARGETS},type=image,name=${{ secrets.ALIYUN_REGISTRY }}/rulego/rulego-server,push-by-digest=true,name-canonical=true,push=true"
+          fi
+          echo "outputs=${TARGETS}" >> "$GITHUB_OUTPUT"
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: context
+          file: server/deploy/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: ${{ steps.targets.outputs.outputs }}
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to Aliyun Registry
+        if: ${{ secrets.ALIYUN_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+      - name: Merge manifests (Docker Hub)
+        # 与 docker job 的 push targets 同一门控：未配 Hub Secrets 时只推 GHCR
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#v}"
+          MINOR="${V%.*}"
+          for TAG in "${V}" "${MINOR}" "latest"; do
+            docker buildx imagetools create -t "${IMAGE_HUB}:${TAG}" $(ls /tmp/digests | xargs -I{} echo "${IMAGE_HUB}@sha256:{}")
+          done
+      - name: Merge manifests (GHCR)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#v}"
+          MINOR="${V%.*}"
+          for TAG in "${V}" "${MINOR}" "latest"; do
+            docker buildx imagetools create -t "${IMAGE_GHCR}:${TAG}" $(ls /tmp/digests | xargs -I{} echo "${IMAGE_GHCR}@sha256:{}")
+          done
+      - name: Merge manifests (Aliyun)
+        if: ${{ secrets.ALIYUN_USERNAME != '' }}
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#v}"
+          MINOR="${V%.*}"
+          ALI="${{ secrets.ALIYUN_REGISTRY }}/rulego/rulego-server"
+          for TAG in "${V}" "${MINOR}" "latest"; do
+            docker buildx imagetools create -t "${ALI}:${TAG}" $(ls /tmp/digests | xargs -I{} echo "${ALI}@sha256:{}")
+          done
+      - name: Inspect image
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: docker buildx imagetools inspect "${IMAGE_GHCR}:${VERSION#v}"
+
+  chart:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Package and push chart
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#v}"
+          helm package server/deploy/kubernetes/chart/rulego-server --version "${V}" --app-version "${VERSION}" -d packaged
+          helm push "packaged/rulego-server-${V}.tgz" oci://ghcr.io/rulego/charts
+      - name: Generate all-in-one manifest
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          {
+            echo "# RuleGo Server 单文件部署（kubectl apply -f rulego-server-all-in-one.yaml）"
+            echo "# 本文件由 CI 在每次发版时用 helm template 重新生成；手工定制请改用 Helm chart："
+            echo "#   helm install rulego-server oci://ghcr.io/rulego/charts/rulego-server --version ${VERSION#v}"
+            echo "# 镜像 tag 锁定为构建时版本，升级请重新下载对应版本的本文件。"
+            echo "apiVersion: v1"
+            echo "kind: Namespace"
+            echo "metadata:"
+            echo "  name: rulego"
+            helm template rulego-server server/deploy/kubernetes/chart/rulego-server --namespace rulego --set image.tag="${VERSION}"
+          } > rulego-server-all-in-one.yaml
+      - name: Upload all-in-one
+        uses: actions/upload-artifact@v4
+        with:
+          name: rulego-server-all-in-one
+          path: rulego-server-all-in-one.yaml
+
+  release:
+    needs: [build, chart]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          name: rulego-server-compressed
+          path: dist
+      - name: Download all-in-one
+        uses: actions/download-artifact@v4
+        with:
+          name: rulego-server-all-in-one
+          path: dist
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # install.sh 按 releases/latest/download/<附件名> 直链下载，归档命名不可改
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/sha256sums.txt
+            dist/rulego-server-all-in-one.yaml
+          generate_release_notes: true

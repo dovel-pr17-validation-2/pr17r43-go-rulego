@@ -1,0 +1,76 @@
+package services
+
+import (
+	"github.com/rulego/rulego/api/types"
+	"github.com/rulego/rulego/server/model"
+)
+
+// ChainCatalog 规则链目录服务接口，供其他模块（如 mcp）使用
+type ChainCatalog interface {
+	List(username, keywords string, root *bool, disabled *bool, category string, size, page int) ([]types.RuleChain, int, error)
+	Get(username, chainId string) ([]byte, error)
+	GetAsRuleChain(username, chainId string) (types.RuleChain, error)
+}
+
+// ChainExecutor 规则链执行器接口
+type ChainExecutor interface {
+	Execute(username, chainId string, msg types.RuleMsg, opts ...types.RuleContextOption) error
+	ExecuteAndWait(username, chainId string, msg types.RuleMsg, opts ...types.RuleContextOption) error
+}
+
+// ChainLifecycleEvent 链生命周期事件。
+type ChainLifecycleEvent struct {
+	Username string // 链所属用户（多租户模型下即 username）
+	ChainId  string
+	DSL      []byte // 事件发生时的链定义 JSON
+}
+
+// ChainLifecycleListener 链生命周期监听器，供嵌入式宿主感知链变更。
+// 监听器应幂等且非阻塞；panic 由调用方捕获，不影响主流程。
+type ChainLifecycleListener interface {
+	// OnSaved 链保存到存储后触发（涵盖创建和更新）。
+	OnSaved(event ChainLifecycleEvent)
+	// OnDeployed 链部署到引擎池后触发。
+	OnDeployed(event ChainLifecycleEvent)
+	// OnUndeployed 链从引擎池移除后触发。
+	OnUndeployed(event ChainLifecycleEvent)
+	// OnDeleted 链从存储永久删除后触发。
+	OnDeleted(event ChainLifecycleEvent)
+}
+
+// BaseChainLifecycleListener 全部事件的空实现，嵌入后只覆盖关心的方法即可。
+type BaseChainLifecycleListener struct{}
+
+func (BaseChainLifecycleListener) OnSaved(ChainLifecycleEvent)      {}
+func (BaseChainLifecycleListener) OnDeployed(ChainLifecycleEvent)   {}
+func (BaseChainLifecycleListener) OnUndeployed(ChainLifecycleEvent) {}
+func (BaseChainLifecycleListener) OnDeleted(ChainLifecycleEvent)    {}
+
+// RuleAdminService 规则链管理服务接口
+type RuleAdminService interface {
+	SaveAndLoad(username, chainId string, def []byte) error
+	Deploy(username, chainId string) error
+	Undeploy(username, chainId string) error
+	Delete(username, chainId string) error
+	SaveBaseInfo(username, chainId string, baseInfo types.RuleChainBaseInfo) error
+	SaveConfiguration(username, chainId string, key string, configuration interface{}) error
+	SetMainChainId(username, chainId string) error
+	GetEngine(username, chainId string) (types.RuleEngine, bool)
+	GetRuleConfig(username string) types.Config
+	GetSetting(username, key string) string
+	// AddLifecycleListener 注册链生命周期监听器，须在 App.Start() 之前调用。
+	AddLifecycleListener(listener ChainLifecycleListener)
+}
+
+// RuleVersionService 规则链版本历史服务：保存快照（手动版本/草稿自动快照），可回滚到任意快照。
+// 仅在版本存储可用时注册到容器；未注册表示宿主未提供版本存储。
+type RuleVersionService interface {
+	// ListVersions 按链倒序列出版本（最新在前），分页；返回值不含 DSL
+	ListVersions(username, chainId string, size, page int) ([]model.RuleVersion, int, error)
+	// GetVersion 获取单个版本（含 DSL）
+	GetVersion(username, chainId, versionId string) (model.RuleVersion, error)
+	// SaveVersion 保存并把本次保存记为手动版本；版本功能关闭时等价于普通保存
+	SaveVersion(username, chainId string, def []byte) error
+	// RollbackVersion 回滚到指定版本：以该版本 DSL 重新走保存（保存即部署语义）
+	RollbackVersion(username, chainId, versionId string) error
+}

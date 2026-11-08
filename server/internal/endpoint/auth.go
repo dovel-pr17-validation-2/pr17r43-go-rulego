@@ -1,0 +1,340 @@
+package endpoint
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	endpointApi "github.com/rulego/rulego/api/types/endpoint"
+	"github.com/rulego/rulego/endpoint"
+	"github.com/rulego/rulego/server/config"
+	"github.com/rulego/rulego/server/internal/constants"
+	"github.com/rulego/rulego/server/model"
+	"github.com/rulego/rulego/server/services"
+)
+
+// ruleGoClaim JWT claim
+type ruleGoClaim struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// loginLimiter 登录速率限制器（基于 IP）
+type loginLimiter struct {
+	mu          sync.Mutex
+	attempts    map[string]*attemptInfo
+	maxAttempts int           // 窗口期内最大尝试次数；负数表示关闭限流
+	window      time.Duration // 滑动窗口
+	disabled    bool
+}
+
+type attemptInfo struct {
+	count    int
+	lastTime time.Time
+}
+
+const (
+	defaultMaxLoginAttempts = 10              // 每个 IP 窗口期内最大尝试次数
+	defaultLoginWindow      = 1 * time.Minute // 窗口期
+)
+
+// 全局登录限速器，参数由配置注入（见 configureLoginLimiter）
+var limiter = &loginLimiter{
+	attempts:    make(map[string]*attemptInfo),
+	maxAttempts: defaultMaxLoginAttempts,
+	window:      defaultLoginWindow,
+}
+
+// configureLoginLimiter 按配置设置限流参数。0 取默认值；maxAttempts 负数关闭限流。
+func configureLoginLimiter(maxAttempts, windowSeconds int) {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if maxAttempts == 0 {
+		maxAttempts = defaultMaxLoginAttempts
+	}
+	if windowSeconds == 0 {
+		windowSeconds = int(defaultLoginWindow / time.Second)
+	}
+	limiter.maxAttempts = maxAttempts
+	limiter.window = time.Duration(windowSeconds) * time.Second
+	limiter.disabled = maxAttempts < 0
+}
+
+const (
+	defaultMaxChatRequests = 60              // 每个用户窗口期内最大聊天直通调用次数
+	defaultChatWindow      = 1 * time.Minute // 窗口期
+)
+
+// 聊天直通端点限速器（基于用户名），防止逐次消耗上游 LLM 配额的端点被高频刷
+var chatLimiter = &loginLimiter{
+	attempts:    make(map[string]*attemptInfo),
+	maxAttempts: defaultMaxChatRequests,
+	window:      defaultChatWindow,
+}
+
+// configureChatLimiter 按配置设置聊天直通限流参数，语义同 configureLoginLimiter
+func configureChatLimiter(maxRequests, windowSeconds int) {
+	chatLimiter.mu.Lock()
+	defer chatLimiter.mu.Unlock()
+	if maxRequests == 0 {
+		maxRequests = defaultMaxChatRequests
+	}
+	if windowSeconds == 0 {
+		windowSeconds = int(defaultChatWindow / time.Second)
+	}
+	chatLimiter.maxAttempts = maxRequests
+	chatLimiter.window = time.Duration(windowSeconds) * time.Second
+	chatLimiter.disabled = maxRequests < 0
+}
+
+// check 允许该 IP 继续登录则返回 true
+func (l *loginLimiter) check(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.disabled {
+		return true
+	}
+	info, ok := l.attempts[ip]
+	if !ok || time.Since(info.lastTime) > l.window {
+		l.attempts[ip] = &attemptInfo{count: 1, lastTime: time.Now()}
+		return true
+	}
+	info.lastTime = time.Now()
+	info.count++
+	return info.count <= l.maxAttempts
+}
+
+// 后台定期清理过期的限速条目
+func init() {
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			cleanupLimiter(limiter)
+			cleanupLimiter(chatLimiter)
+			deniedEvents.cleanup()
+		}
+	}()
+}
+
+func cleanupLimiter(l *loginLimiter) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key, info := range l.attempts {
+		if time.Since(info.lastTime) > l.window {
+			delete(l.attempts, key)
+		}
+	}
+}
+
+func createToken(cfg *config.Config, claim ruleGoClaim) (*string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claim)
+	tokenStr, err := token.SignedString([]byte(cfg.JwtSecretKey))
+	if err != nil {
+		return nil, err
+	}
+	return &tokenStr, nil
+}
+
+// extractAuthorization 从请求中提取 authorization 值。
+// 从 URL query 取 token 而非 GetParam，避免 FormValue 触发 ParseMultipartForm 消费 body。
+func extractAuthorization(exchange *endpointApi.Exchange) string {
+	authorization := exchange.In.Headers().Get("Authorization")
+	if authorization == "" {
+		if apiKey := exchange.In.Headers().Get("X-API-Key"); apiKey != "" {
+			authorization = constants.BearerPrefix + apiKey
+		}
+	}
+	if authorization == "" {
+		if reqMsg, ok := exchange.In.(interface{ Request() *http.Request }); ok {
+			if req := reqMsg.Request(); req != nil {
+				if token := req.URL.Query().Get("token"); token != "" {
+					authorization = constants.BearerPrefix + token
+				}
+			}
+		}
+	}
+	return authorization
+}
+
+// authProcess 仅认证中间件（不检查权限），等价于 authWithPermission("", "")，保留是为了向后兼容。
+func (s *Server) authProcess() func(endpointApi.Router, *endpointApi.Exchange) bool {
+	return s.authWithPermission("", "")
+}
+
+// authWithPermission 返回认证+授权中间件。resource/action 为空时仅认证不鉴权；
+// Authenticator/Authorizer 从 Container 取，未注册则用默认实现。
+func (s *Server) authWithPermission(resource, action string) func(endpointApi.Router, *endpointApi.Exchange) bool {
+	return func(_ endpointApi.Router, exchange *endpointApi.Exchange) bool {
+		cfg := s.config
+		authorization := extractAuthorization(exchange)
+
+		// 匿名放行（RequireAuth=false）：用默认用户身份，但仍要走 Authorizer，否则
+		// /users 这类敏感接口会被匿名直接调用（建/删用户、purge 数据目录）。默认用户
+		// 当前是 admin 能过，但若将来降权或收紧资源，这层校验就是防线。
+		anonymous := func() bool {
+			username := cfg.DefaultUsername
+			exchange.In.GetMsg().Metadata.PutValue(constants.KeyUsername, username)
+			if resource != "" && action != "" {
+				userCtx := &model.UserContext{Username: username, Roles: s.rolesOfUser(username)}
+				if err := getAuthorizer(s.container).Authorize(userCtx, resource, action); err != nil {
+					s.auditDenied(exchange, model.AuditEvent{
+						Actor:     username,
+						ActorType: "anonymous",
+						Action:    resource + ":" + action,
+					}, "anon|"+clientIP(exchange)+"|"+resource+":"+action)
+					exchange.Out.SetStatusCode(http.StatusForbidden)
+					exchange.Out.SetBody([]byte(`{"error":"forbidden"}`))
+					return false
+				}
+			}
+			return true
+		}
+		if !cfg.RequireAuth && authorization == "" {
+			return anonymous()
+		}
+
+		// 从 Container 取认证器
+		authenticator := getAuthenticator(s.container, cfg)
+		userCtx, err := authenticator.Authenticate(authorization)
+		if err != nil {
+			// 免鉴权部署下过期/无效 token 不锁人：与不带 token 同权，按默认用户放行。
+			// 浏览器常驻已过期 token，逐请求 401 会把用户困在登录页。
+			if !cfg.RequireAuth {
+				return anonymous()
+			}
+			exchange.Out.SetStatusCode(http.StatusUnauthorized)
+			exchange.Out.SetBody([]byte(`{"error":"unauthorized"}`))
+			return false
+		}
+
+		// 设置用户名到 metadata
+		exchange.In.GetMsg().Metadata.PutValue(constants.KeyUsername, userCtx.Username)
+
+		// 鉴权（resource 为空则跳过）
+		if resource != "" && action != "" {
+			authorizer := getAuthorizer(s.container)
+			if err := authorizer.Authorize(userCtx, resource, action); err != nil {
+				s.auditDenied(exchange, model.AuditEvent{
+					Actor:     userCtx.Username,
+					ActorType: "user",
+					Action:    resource + ":" + action,
+				}, userCtx.Username+"|"+clientIP(exchange)+"|"+resource+":"+action)
+				exchange.Out.SetStatusCode(http.StatusForbidden)
+				exchange.Out.SetBody([]byte(`{"error":"forbidden"}`))
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// clientIP 从 exchange 提取客户端 IP：优先代理头，回退底层连接的 RemoteAddr。
+// In.From() 是请求 URL 而非远端地址，不能作 IP 兜底。
+func clientIP(exchange *endpointApi.Exchange) string {
+	xff := exchange.In.Headers().Get("X-Forwarded-For")
+	if xff != "" {
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := exchange.In.Headers().Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	if reqMsg, ok := exchange.In.(interface{ Request() *http.Request }); ok {
+		if req := reqMsg.Request(); req != nil && req.RemoteAddr != "" {
+			if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+				return host
+			}
+			return req.RemoteAddr
+		}
+	}
+	return exchange.In.From()
+}
+
+// checkPassword 校验密码。优先用容器里的 AuthService（先查 UserStore 再回退 config.conf），
+// 未注册时退回只认 config 的实现。
+func (s *Server) checkPassword(username, password string) bool {
+	if svc, err := getServiceRaw[services.AuthService](s, services.KeyAuthService); err == nil {
+		return svc.CheckPassword(username, password)
+	}
+	return s.config.CheckPassword(username, password)
+}
+
+// loginRoute 登录路由
+func (s *Server) loginRoute() endpointApi.Router {
+	cfg := s.config
+	return endpoint.NewRouter().From(s.apiBasePath() + constants.PathLogin).Process(func(_ endpointApi.Router, exchange *endpointApi.Exchange) bool {
+		// 登录速率限制
+		ip := clientIP(exchange)
+		if !limiter.check(ip) {
+			s.auditDenied(exchange, model.AuditEvent{
+				ActorType: "anonymous",
+				Action:    "auth:login",
+				Op:        "rate-limited",
+			}, "login|"+ip)
+			exchange.Out.SetStatusCode(http.StatusTooManyRequests)
+			exchange.Out.SetBody([]byte(`{"error":"too many login attempts, please try again later"}`))
+			return false
+		}
+
+		var user struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.Unmarshal(exchange.In.Body(), &user); err != nil {
+			writeBadRequest(exchange, err)
+			return false
+		}
+		user.Username = strings.TrimSpace(user.Username)
+		user.Password = strings.TrimSpace(user.Password)
+
+		if user.Username == "" || user.Password == "" || !s.checkPassword(user.Username, user.Password) {
+			s.auditRecord(exchange, model.AuditEvent{
+				Actor:     user.Username,
+				ActorType: "user",
+				Action:    "auth:login",
+				Result:    model.AuditResultDenied,
+				Detail:    "invalid username or password",
+			})
+			exchange.Out.SetStatusCode(http.StatusUnauthorized)
+			exchange.Out.SetBody([]byte(`{"error":"invalid username or password"}`))
+			return false
+		}
+
+		// 角色带回登录响应：前端据此显隐「用户管理」入口、决定编辑器是否只读
+		roles := s.rolesOfUser(user.Username)
+
+		expiresAt := time.Now().Add(time.Duration(cfg.JwtExpireTime) * time.Millisecond)
+		token, err := createToken(cfg, ruleGoClaim{
+			Username: user.Username,
+			Role:     strings.Join(roles, ","),
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(expiresAt),
+				Issuer:    cfg.JwtIssuer,
+			},
+		})
+		if err != nil {
+			writeInternalError(exchange, err)
+			return false
+		}
+		writeJSON(exchange, map[string]interface{}{
+			"token":     *token,
+			"expiresAt": expiresAt.Unix(),
+			"username":  user.Username,
+			"roles":     roles,
+		})
+		s.auditRecord(exchange, model.AuditEvent{
+			Actor:     user.Username,
+			ActorType: "user",
+			Action:    "auth:login",
+			Result:    model.AuditResultOK,
+		})
+		return true
+	}).End()
+}
