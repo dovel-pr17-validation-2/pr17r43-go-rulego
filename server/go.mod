@@ -3,7 +3,7 @@ module github.com/rulego/rulego/server
 go 1.25.0
 
 require (
-	github.com/cloudwego/eino v0.9.19
+	github.com/cloudwego/eino v0.9.22
 	github.com/dop251/goja v0.0.0-20231024180952-594410467bc6
 	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/julienschmidt/httprouter v1.3.0
